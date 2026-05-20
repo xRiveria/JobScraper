@@ -548,41 +548,262 @@ function normalize(r: SeekRawJob): Job | null {
   };
 }
 
-/** Narrow detail query — we select only the fields we normalize into Job.
- *  SEEK's real client sends a much bigger query (badges, personalisation,
- *  GPT targeting, etc.) but the server accepts whatever subset we ask for. */
-const JOB_DETAIL_QUERY = `query SeekJobDetails($jobId: ID!, $timezone: Timezone!, $locale: Locale!, $zone: Zone!) {
-  jobDetails(id: $jobId, tracking: { channel: "WEB" }) {
-    job {
-      id
-      title
-      abstract
-      content(platform: WEB)
-      isExpired
-      isLinkOut
-      phoneNumber
-      expiresAt { dateTimeUtc __typename }
-      listedAt { dateTimeUtc __typename }
-      salary { label currencyLabel(zone: $zone) __typename }
-      tracking {
-        classificationInfo { classification subClassification __typename }
-        locationInfo { location area __typename }
-        workTypeIds
+/** Detail query, pasted VERBATIM from a real SPA capture (May 2026).
+ *  SEEK's gateway hashes the incoming query + variable shape against an
+ *  allowlist and rejects mismatches with UNSTABLE_QUERY_ERROR. Do NOT trim
+ *  fields — even removing one __typename will re-break it. We still parse
+ *  only what we need via the narrow SeekDetailResponse interface below;
+ *  the rest of the response just rides along on the wire. */
+const JOB_DETAIL_QUERY = `query jobDetails($jobId: ID!, $jobDetailsViewedCorrelationId: String!, $sessionId: String!, $zone: Zone!, $locale: Locale!, $languageCode: LanguageCodeIso!, $countryCode: CountryCodeIso2!, $timezone: Timezone!, $visitorId: UUID!, $isAuthenticated: Boolean!, $enableJdvBadge: Boolean!, $enableClickToReveal: Boolean!) {
+  jobDetails(
+    id: $jobId
+    tracking: {channel: "WEB", jobDetailsViewedCorrelationId: $jobDetailsViewedCorrelationId, sessionId: $sessionId}
+  ) {
+    ...job
+    insights @include(if: $isAuthenticated) {
+      ... on ApplicantCount {
+        volumeLabel(locale: $locale)
+        count
         __typename
       }
-      advertiser { name __typename }
       __typename
     }
-    workArrangements(channel: "JDV", platform: WEB) {
-      arrangements { type label(locale: $locale) __typename }
+    learningInsights(platform: WEB, zone: $zone, locale: $locale) {
+      analytics
+      content
       __typename
     }
-    insights {
-      ... on ApplicantCount { count volumeLabel(locale: $locale) __typename }
+    gfjInfo {
+      location {
+        countryCode
+        country(locale: $locale)
+        suburb(locale: $locale)
+        region(locale: $locale)
+        state(locale: $locale)
+        postcode
+        __typename
+      }
+      workTypes {
+        label
+        __typename
+      }
+      company {
+        url(locale: $locale, zone: $zone)
+        __typename
+      }
+      __typename
+    }
+    workArrangements(visitorId: $visitorId, channel: "JDV", platform: WEB) {
+      arrangements {
+        type
+        label(locale: $locale)
+        __typename
+      }
+      label(locale: $locale)
+      __typename
+    }
+    seoInfo {
+      normalisedRoleTitle
+      workType
+      classification
+      subClassification
+      where(zone: $zone)
+      broaderLocationName(locale: $locale)
+      normalisedOrganisationName
       __typename
     }
     __typename
   }
+}
+
+fragment badges on JobDetails {
+  badges(visitorId: $visitorId, platform: WEB, locale: $locale) @include(if: $enableJdvBadge) {
+    badges {
+      badge
+      displayText(locale: $locale)
+      ... on JobDetailsInteractiveBadge {
+        message(locale: $locale, zone: $zone)
+        __typename
+      }
+      ... on JobDetailsResponsiveHirerBadge {
+        message(locale: $locale, zone: $zone)
+        badgeScore
+        __typename
+      }
+      __typename
+    }
+    __typename
+  }
+  __typename
+}
+
+fragment job on JobDetails {
+  job {
+    sourceZone
+    tracking {
+      adProductType
+      classificationInfo {
+        classificationId
+        classification
+        subClassificationId
+        subClassification
+        __typename
+      }
+      hasRoleRequirements
+      isPrivateAdvertiser
+      locationInfo {
+        area
+        location
+        locationIds
+        __typename
+      }
+      workTypeIds
+      postedTime
+      __typename
+    }
+    id
+    title
+    phoneNumber
+    isExpired
+    expiresAt {
+      dateTimeUtc
+      __typename
+    }
+    isLinkOut
+    contactMatches {
+      type
+      value
+      __typename
+    }
+    isVerified
+    abstract
+    content(platform: WEB) @skip(if: $enableClickToReveal)
+    content2(zone: $zone) @include(if: $enableClickToReveal)
+    status
+    listedAt {
+      label(context: JOB_POSTED, length: SHORT, timezone: $timezone, locale: $locale)
+      dateTimeUtc
+      __typename
+    }
+    salary {
+      currencyLabel(zone: $zone)
+      label
+      __typename
+    }
+    shareLink(platform: WEB, zone: $zone, locale: $locale)
+    workTypes {
+      label(locale: $locale)
+      __typename
+    }
+    advertiser {
+      id
+      name(locale: $locale)
+      isVerified
+      registrationDate {
+        dateTimeUtc
+        __typename
+      }
+      __typename
+    }
+    location {
+      label(locale: $locale, type: LONG)
+      __typename
+    }
+    classifications {
+      label(languageCode: $languageCode)
+      __typename
+    }
+    products {
+      branding {
+        id
+        cover {
+          url
+          __typename
+        }
+        thumbnailCover: cover(isThumbnail: true) {
+          url
+          __typename
+        }
+        logo {
+          url
+          __typename
+        }
+        __typename
+      }
+      bullets
+      questionnaire {
+        questions
+        __typename
+      }
+      video {
+        url
+        position
+        __typename
+      }
+      __typename
+    }
+    __typename
+  }
+  ...badges
+  companyProfile(zone: $zone) {
+    id
+    name
+    companyNameSlug
+    shouldDisplayReviews
+    branding {
+      logo
+      __typename
+    }
+    overview {
+      description {
+        paragraphs
+        __typename
+      }
+      industry
+      size {
+        description
+        __typename
+      }
+      website {
+        url
+        __typename
+      }
+      __typename
+    }
+    reviewsSummary {
+      overallRating {
+        numberOfReviews {
+          value
+          __typename
+        }
+        value
+        __typename
+      }
+      __typename
+    }
+    perksAndBenefits {
+      title
+      __typename
+    }
+    __typename
+  }
+  companySearchUrl(zone: $zone, languageCode: $languageCode)
+  companyTags {
+    key(languageCode: $languageCode)
+    value
+    __typename
+  }
+  restrictedApplication(countryCode: $countryCode) {
+    label(locale: $locale)
+    __typename
+  }
+  sourcr {
+    image
+    imageMobile
+    link
+    __typename
+  }
+  __typename
 }`;
 
 interface SeekDetailResponse {
@@ -592,24 +813,33 @@ interface SeekDetailResponse {
         id: string;
         title?: string;
         abstract?: string;
+        /** Present when enableClickToReveal=false; we send true, so this is
+         *  typically null/missing — content2 is the field that actually carries
+         *  the HTML body. Kept here as a fallback in case the gateway flips. */
         content?: string;
+        content2?: string;
         isExpired?: boolean;
         isLinkOut?: boolean;
         phoneNumber?: string;
         expiresAt?: { dateTimeUtc?: string };
         listedAt?: { dateTimeUtc?: string };
         salary?: { label?: string };
+        shareLink?: string;
+        location?: { label?: string };
+        advertiser?: { name?: string };
         tracking?: {
           classificationInfo?: { classification?: string; subClassification?: string };
           locationInfo?: { location?: string; area?: string };
           workTypeIds?: string[];
         };
-        advertiser?: { name?: string };
       };
       workArrangements?: {
         arrangements?: Array<{ type?: string; label?: string }>;
       };
-      insights?: Array<{ count?: number; volumeLabel?: string }>;
+      companyProfile?: {
+        name?: string;
+        branding?: { logo?: string };
+      };
     };
   };
   errors?: Array<{ message?: string }>;
@@ -655,20 +885,33 @@ function parseSalaryLabel(label: string | undefined): Job["salary"] {
 }
 
 export async function seekGetJob(jobId: string): Promise<Job | null> {
+  // Per-request session UUID, coupled across cookies + headers + the
+  // `sessionId` body variable. visitorId (body) mirrors sol_id (cookie). See
+  // buildHeaders for the full coupling matrix — any mismatch trips
+  // UNSTABLE_QUERY_ERROR on the gateway.
+  const sessionId = randomUUID();
   const body = {
-    operationName: "SeekJobDetails",
+    operationName: "jobDetails",
     variables: {
       jobId,
-      timezone: "Asia/Singapore",
-      locale: "en-SG",
+      jobDetailsViewedCorrelationId: randomUUID(),
+      sessionId,
       zone: "asia-7",
+      locale: "en-SG",
+      languageCode: "en",
+      countryCode: "SG",
+      timezone: "Asia/Singapore",
+      visitorId: PROCESS_SOL_ID,
+      isAuthenticated: false,
+      enableJdvBadge: true,
+      enableClickToReveal: true,
     },
     query: JOB_DETAIL_QUERY,
   };
 
   const res = await fetch(SEEK_GRAPHQL, {
     method: "POST",
-    headers: buildHeaders(randomUUID()),
+    headers: buildHeaders(sessionId),
     body: JSON.stringify(body),
   });
 
@@ -683,8 +926,9 @@ export async function seekGetJob(jobId: string): Promise<Job | null> {
   const j = raw.data?.jobDetails?.job;
   if (!j || !j.id || !j.title) return null;
 
-  // Description: prefer the full HTML `content`, fall back to `abstract`.
-  const descriptionHtml = j.content ?? j.abstract ?? "";
+  // enableClickToReveal=true selects content2; content is @skipped. Fall back
+  // to content (in case the gateway ever flips) then abstract.
+  const descriptionHtml = j.content2 ?? j.content ?? j.abstract ?? "";
   const descriptionText = descriptionHtml ? stripHtml(descriptionHtml) : undefined;
 
   const cls = j.tracking?.classificationInfo;
@@ -692,7 +936,10 @@ export async function seekGetJob(jobId: string): Promise<Job | null> {
     (x): x is string => !!x,
   );
 
-  const location = j.tracking?.locationInfo?.location
+  // Detail query now exposes a richer location.label; fall back to the older
+  // tracking fields, then to "Singapore" as a last resort.
+  const location = j.location?.label
+    ?? j.tracking?.locationInfo?.location
     ?? j.tracking?.locationInfo?.area
     ?? "Singapore";
 
@@ -702,17 +949,20 @@ export async function seekGetJob(jobId: string): Promise<Job | null> {
     .map((a) => a.label)
     .filter((x): x is string => !!x);
 
-  const applicantInsight = raw.data?.jobDetails?.insights?.find(
-    (i) => typeof i?.count === "number",
-  );
+  // Prefer the company-profile name (locale-aware) over the listing's advertiser name.
+  const companyName =
+    raw.data?.jobDetails?.companyProfile?.name
+    ?? j.advertiser?.name
+    ?? "Unknown";
+  const companyLogo = raw.data?.jobDetails?.companyProfile?.branding?.logo;
 
   return {
     id: `seek:${j.id}`,
     source: "seek",
     sourceId: j.id,
-    url: `${SEEK_HOST}/job/${j.id}`,
+    url: j.shareLink ?? `${SEEK_HOST}/job/${j.id}`,
     title: j.title,
-    company: { name: j.advertiser?.name ?? "Unknown" },
+    company: { name: companyName, logoUrl: companyLogo },
     description: descriptionHtml,
     descriptionText,
     location,
@@ -726,7 +976,10 @@ export async function seekGetJob(jobId: string): Promise<Job | null> {
     salary: parseSalaryLabel(j.salary?.label),
     postedDate: j.listedAt?.dateTimeUtc,
     expiryDate: j.expiresAt?.dateTimeUtc,
-    applicantCount: applicantInsight?.count,
+    // insights are gated on isAuthenticated=true; we send false, so this is
+    // always missing for now. Left as a no-op rather than removed in case
+    // we ever want to flip authentication on.
+    applicantCount: undefined,
     raw,
   };
 }

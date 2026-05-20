@@ -127,6 +127,18 @@ async function main(): Promise<void> {
     return tb - ta;
   });
 
+  // Slim each job for serialization — drops fields the client doesn't need to
+  // bootstrap from disk. The in-memory Job objects above are untouched (the
+  // live server keeps using them as-is); only what hits disk is trimmed.
+  //  - `raw`: debug-only mirror of the upstream payload, often larger than
+  //    the normalized job itself.
+  //  - `descriptionText`: derivable from `description` by stripping tags. The
+  //    client recomputes lazily when it searches over description text.
+  const slimJobs = unique.map((j) => {
+    const { raw: _raw, descriptionText: _t, ...rest } = j;
+    return rest;
+  });
+
   const manifest: Manifest = {
     generatedAt: generatedAt.toISOString(),
     windowDays: WINDOW_DAYS,
@@ -135,7 +147,7 @@ async function main(): Promise<void> {
     dedupedCount: dedupeStats.dupes,
     sourceMergeStats: dedupeStats.merges,
     schemaVersion: 1,
-    jobs: unique,
+    jobs: slimJobs as Job[],
   };
 
   await mkdir(dirname(OUT_PATH), { recursive: true });
