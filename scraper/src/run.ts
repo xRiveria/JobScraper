@@ -19,11 +19,44 @@ import type { Job } from "@aggregator/shared";
 import { scrapeMcf } from "./sources/mcf.js";
 import { scrapeSeek } from "./sources/seek.js";
 import { scrapeGovtech } from "./sources/govtech.js";
-import { dedupeJobs } from "./dedupe.js";
+import { dedupeJobs, type MergeRecord } from "./dedupe.js";
 
 const WINDOW_DAYS = 30;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUT_PATH = resolve(__dirname, "../../data/jobs.json");
+const MERGES_PATH = resolve(__dirname, "../../data/merges.md");
+
+/** Render the merge log as a human-scannable Markdown report. One section per
+ *  merge event so you can spot false positives by skimming. */
+function formatMergeReport(
+  log: MergeRecord[],
+  generatedAt: Date,
+): string {
+  const lines: string[] = [];
+  lines.push(`# Merge report`);
+  lines.push("");
+  lines.push(`Generated ${generatedAt.toISOString()} — ${log.length} merge event(s).`);
+  lines.push("");
+  lines.push(
+    `Each section shows one merge event: the canonical record that was kept`
+      + ` and the records that were folded into it. Use this to audit whether`
+      + ` the dedup pass is collapsing genuinely-duplicate postings or`
+      + ` over-merging distinct roles.`,
+  );
+  lines.push("");
+  log.forEach((m, i) => {
+    lines.push(`## Merge ${i + 1} (${m.pass})`);
+    lines.push("");
+    lines.push(`- **Kept** [${m.kept.source}] ${m.kept.title} — ${m.kept.company}`);
+    lines.push(`  - ${m.kept.url}`);
+    m.merged.forEach((l, j) => {
+      lines.push(`- **Merged ${j + 1}** [${l.source}] ${l.title} — ${l.company}`);
+      lines.push(`  - ${l.url}`);
+    });
+    lines.push("");
+  });
+  return lines.join("\n");
+}
 
 interface Manifest {
   /** ISO timestamp the snapshot was generated. */
@@ -80,7 +113,7 @@ async function main(): Promise<void> {
   };
   console.log("Per-source counts:", sourceCounts);
 
-  const { unique, stats: dedupeStats } = dedupeJobs([
+  const { unique, stats: dedupeStats, mergeLog } = dedupeJobs([
     ...mcfJobs,
     ...seekJobs,
     ...govtechJobs,
@@ -111,6 +144,11 @@ async function main(): Promise<void> {
   console.log(
     `Wrote ${unique.length} jobs (${dedupeStats.dupes} dupes merged) to ${OUT_PATH} — ${sizeMb} MB`,
   );
+
+  // Merge audit report — written alongside jobs.json so it ships in the same
+  // orphan-branch commit and can be eyeballed from GitHub directly.
+  await writeFile(MERGES_PATH, formatMergeReport(mergeLog, generatedAt));
+  console.log(`Wrote ${mergeLog.length} merge event(s) to ${MERGES_PATH}`);
 }
 
 main().catch((e) => {

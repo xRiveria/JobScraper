@@ -28,6 +28,8 @@ import type { Job, JobSource } from "@aggregator/shared";
 import {
   canonicalCompany,
   daysBetween,
+  descriptionContainment,
+  descriptionFingerprint,
   normalizeTitleForMatch,
   titleTokens,
   tokenOverlap,
@@ -50,10 +52,40 @@ const SOURCE_PRIORITY: Record<JobSource, number> = {
  *  reposting that happens to share a title. 30d matches our scrape window. */
 const MERGE_WINDOW_DAYS = 30;
 
-/** Token-overlap threshold for fuzzy matching in pass 2. 0.7 means 70% of
- *  the shorter title's tokens must appear in the longer one. Lower = more
- *  merges + more false positives. Tune via telemetry, not vibes. */
+/** Jaccard threshold for fuzzy matching in pass 2. 0.7 means at least 70%
+ *  of the union of tokens must overlap. With Jaccard this is strict — most
+ *  legitimate same-job pairs differ only in casing or stopwords. Lower this
+ *  cautiously, false positives compound quickly. */
 const FUZZY_THRESHOLD = 0.7;
+
+/** Minimum tokens (post-stopword filter) on each side before a pair is
+ *  eligible for fuzzy matching. Short generic titles ("Engineer", "Manager",
+ *  "Analyst") have too few discriminators — at 1-2 tokens, Jaccard fires
+ *  trivially. Below this threshold, only Pass 1 exact-match can merge. */
+const FUZZY_MIN_TOKENS = 3;
+
+/** Description-similarity thresholds. Used as a second signal so that e.g.
+ *  three legitimately different "Senior/Product Manager" roles at the same
+ *  employer don't collapse into one record just because their titles tied.
+ *  Only enforced when BOTH descriptions have enough meaningful tokens —
+ *  otherwise fall back to title+date alone (SEEK teasers vs MCF full JDs
+ *  shouldn't be punished for length mismatch). */
+const DESC_MIN_TOKENS = 30;
+const DESC_CONTAINMENT_THRESHOLD = 0.4;
+const DESC_MIN_SHARED = 8;
+
+/** Returns true when descriptions agree closely enough to confirm a merge,
+ *  OR when at least one side is too thin to apply the test. The latter keeps
+ *  cross-source teaser-vs-fullJD pairs working — title+date already gates
+ *  those tightly. */
+function descriptionsAgree(
+  a: Set<string>,
+  b: Set<string>,
+): boolean {
+  if (a.size < DESC_MIN_TOKENS || b.size < DESC_MIN_TOKENS) return true;
+  const { containment, shared } = descriptionContainment(a, b);
+  return shared >= DESC_MIN_SHARED && containment >= DESC_CONTAINMENT_THRESHOLD;
+}
 
 export interface DedupeStats {
   /** Count of jobs that were merged INTO another record (so output -
@@ -69,9 +101,31 @@ export interface DedupeStats {
   };
 }
 
+/** A single merge event — the canonical record we kept, plus the records that
+ *  got folded into it. Emitted so the scraper can write a human-readable
+ *  report file for manual audit (catch false-positive merges). */
+export interface MergeRecord {
+  pass: "exact" | "fuzzy";
+  kept: { id: string; source: string; title: string; company: string; url: string };
+  merged: Array<{ id: string; source: string; title: string; company: string; url: string }>;
+}
+
 export interface DedupeResult {
   unique: Job[];
   stats: DedupeStats;
+  /** Detailed merge log, one entry per merge event. Empty for runs with no
+   *  cross-source overlap. */
+  mergeLog: MergeRecord[];
+}
+
+function jobRef(j: Job): MergeRecord["kept"] {
+  return {
+    id: j.id,
+    source: j.source,
+    title: j.title,
+    company: j.company.name,
+    url: j.url,
+  };
 }
 
 function pickWinner(jobs: Job[]): Job {
@@ -148,6 +202,24 @@ export function dedupeJobs(jobs: Job[]): DedupeResult {
     dupes: 0,
     merges: { mcfAndSeek: 0, mcfAndGovtech: 0, seekAndGovtech: 0, allThree: 0 },
   };
+  const mergeLog: MergeRecord[] = [];
+
+  function recordMerge(group: Job[], pass: MergeRecord["pass"]): void {
+    const winner = pickWinner(group);
+    const losers = group.filter((j) => j !== winner);
+    mergeLog.push({
+      pass,
+      kept: jobRef(winner),
+      merged: losers.map(jobRef),
+    });
+  }
+
+  // Precompute description fingerprints once per job — both passes consult
+  // them via descriptionsAgree() below.
+  const fp = new Map<Job, Set<string>>();
+  for (const j of jobs) {
+    fp.set(j, descriptionFingerprint(j.description, j.descriptionText));
+  }
 
   // Bucket by canonical company. Different companies = different jobs, full stop.
   const byCompany = new Map<string, Job[]>();
@@ -176,13 +248,20 @@ export function dedupeJobs(jobs: Job[]): DedupeResult {
         stillSingle.push(sameTitleGroup[0]!);
         continue;
       }
-      // Split the title-group further by posted-date proximity. Anything
-      // outside MERGE_WINDOW_DAYS forms its own cluster (likely a re-post,
-      // not a cross-source duplicate).
+      // Split the title-group further by posted-date proximity AND
+      // description agreement. Anything outside MERGE_WINDOW_DAYS, or whose
+      // description fingerprint doesn't match an existing member, forms its
+      // own cluster (likely a different role with a same-shaped title rather
+      // than a cross-source duplicate).
       const clusters: Job[][] = [];
       for (const j of sameTitleGroup) {
+        const jf = fp.get(j)!;
         const home = clusters.find((c) =>
-          c.some((other) => daysBetween(j.postedDate, other.postedDate) <= MERGE_WINDOW_DAYS),
+          c.some(
+            (other) =>
+              daysBetween(j.postedDate, other.postedDate) <= MERGE_WINDOW_DAYS
+              && descriptionsAgree(jf, fp.get(other)!),
+          ),
         );
         if (home) home.push(j);
         else clusters.push([j]);
@@ -194,36 +273,44 @@ export function dedupeJobs(jobs: Job[]): DedupeResult {
           const merged = merge(c);
           stats.dupes += c.length - 1;
           trackMerge(c, stats);
+          recordMerge(c, "exact");
           output.push(merged);
         }
       }
     }
 
-    // ---- Pass 2: fuzzy token-overlap on remaining singletons ----
+    // ---- Pass 2: fuzzy Jaccard overlap on remaining singletons ----
     // Greedy: walk the list once, for each job try to find an earlier-emitted
-    // cluster it fits into. O(n^2) per bucket, but buckets are small (10s of
-    // jobs per company at SG scale).
-    const fuzzyClusters: Array<{ tokens: string[]; jobs: Job[] }> = [];
+    // cluster it fits into. We compare ONLY against the seed (first member)
+    // tokens — NOT a growing union — so clusters can't drift token-by-token.
+    // O(n^2) per bucket, but buckets are small (10s of jobs per company).
+    const fuzzyClusters: Array<{ seedTokens: string[]; jobs: Job[] }> = [];
     for (const j of stillSingle) {
       const toks = titleTokens(j.title);
       let placed = false;
+      // Too few tokens — can't risk fuzzy matching; only Pass 1 can collapse these.
+      if (toks.length < FUZZY_MIN_TOKENS) {
+        fuzzyClusters.push({ seedTokens: toks, jobs: [j] });
+        continue;
+      }
+      const jf = fp.get(j)!;
       for (const cluster of fuzzyClusters) {
-        if (tokenOverlap(toks, cluster.tokens) < FUZZY_THRESHOLD) continue;
+        if (cluster.seedTokens.length < FUZZY_MIN_TOKENS) continue;
+        if (tokenOverlap(toks, cluster.seedTokens) < FUZZY_THRESHOLD) continue;
         if (
           !cluster.jobs.some(
-            (other) => daysBetween(j.postedDate, other.postedDate) <= MERGE_WINDOW_DAYS,
+            (other) =>
+              daysBetween(j.postedDate, other.postedDate) <= MERGE_WINDOW_DAYS
+              && descriptionsAgree(jf, fp.get(other)!),
           )
         ) {
           continue;
         }
         cluster.jobs.push(j);
-        // Expand the cluster's token set so subsequent jobs can match either
-        // member — gives slightly more permissive chaining without going wild.
-        cluster.tokens = Array.from(new Set([...cluster.tokens, ...toks]));
         placed = true;
         break;
       }
-      if (!placed) fuzzyClusters.push({ tokens: toks, jobs: [j] });
+      if (!placed) fuzzyClusters.push({ seedTokens: toks, jobs: [j] });
     }
 
     for (const c of fuzzyClusters) {
@@ -233,10 +320,11 @@ export function dedupeJobs(jobs: Job[]): DedupeResult {
         const merged = merge(c.jobs);
         stats.dupes += c.jobs.length - 1;
         trackMerge(c.jobs, stats);
+        recordMerge(c.jobs, "fuzzy");
         output.push(merged);
       }
     }
   }
 
-  return { unique: output, stats };
+  return { unique: output, stats, mergeLog };
 }
