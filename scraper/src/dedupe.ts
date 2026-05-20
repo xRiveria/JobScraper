@@ -74,6 +74,27 @@ const DESC_MIN_TOKENS = 30;
 const DESC_CONTAINMENT_THRESHOLD = 0.4;
 const DESC_MIN_SHARED = 8;
 
+/** True only when each title token-set has at least one token the other
+ *  doesn't. Prevents the subset trap: "Software Engineer" vs "Software
+ *  Engineer (Linux)" — Jaccard alone scores 0.8 and merges; but the right
+ *  side has the "linux" discriminator and the left side has nothing extra,
+ *  so this returns false and we skip the merge. Same logic kills "X" vs
+ *  "Senior X", "X" vs "Staff X", "X" vs "X (Specialization)", etc. */
+function hasMutualUniqueTokens(a: string[], b: string[]): boolean {
+  const setA = new Set(a);
+  const setB = new Set(b);
+  let aHasUnique = false;
+  for (const t of setA) {
+    if (!setB.has(t)) {
+      aHasUnique = true;
+      break;
+    }
+  }
+  if (!aHasUnique) return false;
+  for (const t of setB) if (!setA.has(t)) return true;
+  return false;
+}
+
 /** Returns true when descriptions agree closely enough to confirm a merge,
  *  OR when at least one side is too thin to apply the test. The latter keeps
  *  cross-source teaser-vs-fullJD pairs working — title+date already gates
@@ -296,6 +317,11 @@ export function dedupeJobs(jobs: Job[]): DedupeResult {
       const jf = fp.get(j)!;
       for (const cluster of fuzzyClusters) {
         if (cluster.seedTokens.length < FUZZY_MIN_TOKENS) continue;
+        // Reject strict subset/superset pairs — adding one qualifier token to
+        // a base title (e.g. "X" → "X (Linux)") almost always means a
+        // specialization, not a duplicate. Without this gate Jaccard hands
+        // back 0.75-0.85 for these pairs and they wrongly merge.
+        if (!hasMutualUniqueTokens(toks, cluster.seedTokens)) continue;
         if (tokenOverlap(toks, cluster.seedTokens) < FUZZY_THRESHOLD) continue;
         if (
           !cluster.jobs.some(
