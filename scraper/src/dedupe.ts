@@ -300,56 +300,13 @@ export function dedupeJobs(jobs: Job[]): DedupeResult {
       }
     }
 
-    // ---- Pass 2: fuzzy Jaccard overlap on remaining singletons ----
-    // Greedy: walk the list once, for each job try to find an earlier-emitted
-    // cluster it fits into. We compare ONLY against the seed (first member)
-    // tokens — NOT a growing union — so clusters can't drift token-by-token.
-    // O(n^2) per bucket, but buckets are small (10s of jobs per company).
-    const fuzzyClusters: Array<{ seedTokens: string[]; jobs: Job[] }> = [];
-    for (const j of stillSingle) {
-      const toks = titleTokens(j.title);
-      let placed = false;
-      // Too few tokens — can't risk fuzzy matching; only Pass 1 can collapse these.
-      if (toks.length < FUZZY_MIN_TOKENS) {
-        fuzzyClusters.push({ seedTokens: toks, jobs: [j] });
-        continue;
-      }
-      const jf = fp.get(j)!;
-      for (const cluster of fuzzyClusters) {
-        if (cluster.seedTokens.length < FUZZY_MIN_TOKENS) continue;
-        // Reject strict subset/superset pairs — adding one qualifier token to
-        // a base title (e.g. "X" → "X (Linux)") almost always means a
-        // specialization, not a duplicate. Without this gate Jaccard hands
-        // back 0.75-0.85 for these pairs and they wrongly merge.
-        if (!hasMutualUniqueTokens(toks, cluster.seedTokens)) continue;
-        if (tokenOverlap(toks, cluster.seedTokens) < FUZZY_THRESHOLD) continue;
-        if (
-          !cluster.jobs.some(
-            (other) =>
-              daysBetween(j.postedDate, other.postedDate) <= MERGE_WINDOW_DAYS
-              && descriptionsAgree(jf, fp.get(other)!),
-          )
-        ) {
-          continue;
-        }
-        cluster.jobs.push(j);
-        placed = true;
-        break;
-      }
-      if (!placed) fuzzyClusters.push({ seedTokens: toks, jobs: [j] });
-    }
-
-    for (const c of fuzzyClusters) {
-      if (c.jobs.length === 1) {
-        output.push(c.jobs[0]!);
-      } else {
-        const merged = merge(c.jobs);
-        stats.dupes += c.jobs.length - 1;
-        trackMerge(c.jobs, stats);
-        recordMerge(c.jobs, "fuzzy");
-        output.push(merged);
-      }
-    }
+    // Pass 2 (fuzzy Jaccard merge) is deliberately disabled. It produced
+    // too many false positives on subset-style title pairs ("X" vs "Senior
+    // X", "X" vs "X (Linux)") where domain-vocabulary overlap let the
+    // description gate clear too — and the cost of wrongly collapsing
+    // distinct roles is worse than the cost of shipping a few cross-source
+    // duplicates. Pass 1 (exact title key + date + description) is enough.
+    for (const j of stillSingle) output.push(j);
   }
 
   return { unique: output, stats, mergeLog };
