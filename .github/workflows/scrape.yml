@@ -47,29 +47,35 @@ jobs:
           GIT_COMMITTER_NAME: github-actions[bot]
           GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
         run: |
-          # Move the generated file out of the working tree so we can create
-          # a clean orphan branch with only that file in it.
+          # Move the generated files out of the working tree so we can create
+          # a clean orphan branch containing only the artifacts.
           cp data/jobs.json /tmp/jobs.json
+          cp data/merges.md /tmp/merges.md
 
           # Orphan branch = no parent commit = history stays 1 deep on force-push.
           git checkout --orphan data
           git rm -rf . > /dev/null
           mkdir -p data
           mv /tmp/jobs.json data/jobs.json
+          mv /tmp/merges.md data/merges.md
 
           # A tiny README so visitors to the branch understand what they're looking at.
           cat > README.md <<'EOF'
           # data branch
 
           This is an orphan branch auto-rebuilt by `.github/workflows/scrape.yml`.
-          It contains a single artifact: `data/jobs.json` — a snapshot of
-          Singapore job listings (last 30 days) from MyCareersFuture, JobStreet,
-          and careers.gov.sg, deduped and normalized.
+          Contents:
+
+          - `data/jobs.json` — snapshot of Singapore job listings (last 30 days)
+            from MyCareersFuture, JobStreet, and careers.gov.sg, deduped and
+            normalized.
+          - `data/merges.md` — human-readable audit log of every merge the
+            dedupe pass performed during this run.
 
           The branch is force-recreated on every scrape run, so git history is
           always exactly one commit deep.
           EOF
 
-          git add data/jobs.json README.md
+          git add data/jobs.json data/merges.md README.md
           git commit -m "Scrape $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           git push --force origin data
