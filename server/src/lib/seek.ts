@@ -344,140 +344,6 @@ const JOB_SEARCH_QUERY = `query JobSearchV6($params: JobSearchV6QueryInput!, $lo
  *  load. Must match across cookies AND params or the gateway rejects. */
 const PROCESS_SOL_ID = randomUUID();
 
-// ---------------- Cloudflare bot-management session ----------------
-//
-// Cloudflare's bot management fingerprints first-contact requests on TLS
-// handshake + header set + IP reputation. The clearance signal is the
-// `__cf_bm` cookie, set on a "verified" response. Without it every request
-// looks like first contact and gets the JS challenge (403 "Just a moment...").
-//
-// We warm a single shared session by visiting sg.jobstreet.com once at startup,
-// harvest whatever cookies Cloudflare and SEEK set, and replay them on every
-// detail/GraphQL call. `__cf_bm` lasts ~30 min; we refresh proactively after
-// COOKIE_TTL_MS, and reactively when we see a 403 with a challenge body.
-//
-// This isn't a full bypass — TLS fingerprinting can still revoke clearance —
-// but it shifts most requests from "first contact" to "returning visitor"
-// and dramatically reduces challenge rate.
-
-interface CookieEntry {
-  value: string;
-  /** Epoch ms when the cookie should be considered expired. */
-  expiresAt: number;
-}
-
-const COOKIE_TTL_MS = 25 * 60 * 1000; // 25 min — refresh before __cf_bm's 30 min
-
-class CloudflareSession {
-  private jar = new Map<string, CookieEntry>();
-  private warmingPromise: Promise<void> | null = null;
-  private lastWarmAt = 0;
-
-  /** Make sure we have a fresh cookie jar before the caller fires a request.
-   *  Concurrent callers share one in-flight warmup so we don't stampede. */
-  async ensureWarm(): Promise<void> {
-    const stale = Date.now() - this.lastWarmAt > COOKIE_TTL_MS;
-    if (!stale && this.jar.size > 0) return;
-    if (this.warmingPromise) return this.warmingPromise;
-    this.warmingPromise = this.warm().finally(() => {
-      this.warmingPromise = null;
-    });
-    return this.warmingPromise;
-  }
-
-  /** Force a refresh on next call. Used when we see a 403 — the existing
-   *  cookies are no longer trusted. */
-  invalidate(): void {
-    this.jar.clear();
-    this.lastWarmAt = 0;
-  }
-
-  /** Cookie header value formatted for use in an outgoing request. */
-  cookieHeader(): string {
-    const parts: string[] = [];
-    for (const [name, entry] of this.jar) {
-      parts.push(`${name}=${entry.value}`);
-    }
-    // Inject our own process-stable identifiers alongside Cloudflare's.
-    // SEEK's GraphQL gateway cross-checks solId / Jobseeker* against headers.
-    parts.push(`sol_id=${PROCESS_SOL_ID}`);
-    return parts.join("; ");
-  }
-
-  /** Merge a Set-Cookie response into the jar. */
-  ingest(response: Response): void {
-    // Node 20+ exposes getSetCookie(); older builds need raw header access.
-    // The standard headers.get("set-cookie") joins multiple cookies with a
-    // comma which corrupts expires=Date,GMT segments, so we avoid it.
-    const setCookies =
-      typeof (response.headers as { getSetCookie?: () => string[] }).getSetCookie === "function"
-        ? (response.headers as { getSetCookie: () => string[] }).getSetCookie()
-        : [];
-    for (const raw of setCookies) {
-      const eqIdx = raw.indexOf("=");
-      const semiIdx = raw.indexOf(";");
-      if (eqIdx === -1) continue;
-      const name = raw.slice(0, eqIdx).trim();
-      const value = raw.slice(eqIdx + 1, semiIdx === -1 ? undefined : semiIdx);
-      if (!name || !value) continue;
-      this.jar.set(name, {
-        value,
-        // We don't fully parse Max-Age/Expires — our own TTL is shorter than
-        // any cookie SEEK sets, so the global refresh handles staleness.
-        expiresAt: Date.now() + COOKIE_TTL_MS,
-      });
-    }
-  }
-
-  private async warm(): Promise<void> {
-    // A single SERP page-load. Cloudflare's challenge runs once and sets the
-    // `__cf_bm` clearance cookie for the rest of the visit. We don't need
-    // to actually parse anything; we just want the Set-Cookie headers.
-    try {
-      const res = await fetch(`${SEEK_HOST}/jobs`, {
-        headers: browserHeaders({ accept: "text/html" }),
-      });
-      this.ingest(res);
-      // Consume the body so the connection releases — we don't need it.
-      await res.text().catch(() => "");
-      this.lastWarmAt = Date.now();
-    } catch (e) {
-      // Don't throw — caller will hit Cloudflare directly without cookies
-      // and we'll surface the failure on the actual request instead.
-      console.warn("[seek] cookie warmup failed:", e instanceof Error ? e.message : e);
-    }
-  }
-}
-
-const cfSession = new CloudflareSession();
-
-/** Full Chrome-like header set. Cloudflare's heuristics check for the
- *  presence and ordering of sec-ch-ua* and sec-fetch-* — a request that
- *  looks like Node fetch (only user-agent + accept) is much more likely
- *  to be challenged than one that mirrors a real browser navigation. */
-function browserHeaders(opts: { accept?: string; referer?: string } = {}): Record<string, string> {
-  return {
-    accept:
-      opts.accept ??
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "accept-language": "en-US,en;q=0.9",
-    "cache-control": "no-cache",
-    pragma: "no-cache",
-    priority: "u=0, i",
-    "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-fetch-dest": opts.accept?.includes("json") ? "empty" : "document",
-    "sec-fetch-mode": opts.accept?.includes("json") ? "cors" : "navigate",
-    "sec-fetch-site": opts.referer ? "same-origin" : "none",
-    "sec-fetch-user": "?1",
-    "upgrade-insecure-requests": "1",
-    "user-agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-    ...(opts.referer ? { referer: opts.referer } : {}),
-  };
-}
-
 function buildHeaders(sessionId: string): Record<string, string> {
   // SEEK's gateway hashes incoming requests against an allowlist and rejects
   // mismatches with UNSTABLE_QUERY_ERROR. From a real captured request the
@@ -491,24 +357,17 @@ function buildHeaders(sessionId: string): Record<string, string> {
   //   - param  userSessionId
   // And `solId` param must equal the `sol_id` cookie. Rotating any of these
   // independently triggers UNSTABLE_QUERY_ERROR even with a valid query.
-  //
-  // The session-managed cookies (__cf_bm etc.) are appended via cfSession;
-  // SEEK's own Jobseeker* cookies must match the per-request session UUID
-  // so we inject them inline. sol_id is added by cfSession.cookieHeader().
-  const sessionCookies = `JobseekerSessionId=${sessionId}; JobseekerVisitorId=${sessionId}`;
-  const fullCookies = `${cfSession.cookieHeader()}; ${sessionCookies}`;
+  const cookies = [
+    `sol_id=${PROCESS_SOL_ID}`,
+    `JobseekerSessionId=${sessionId}`,
+    `JobseekerVisitorId=${sessionId}`,
+  ].join("; ");
   return {
     "content-type": "application/json",
     accept: "*/*",
     "accept-language": "en-US,en;q=0.9",
     origin: SEEK_HOST,
     referer: `${SEEK_HOST}/jobs`,
-    "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
     "seek-request-brand": "jobstreet",
     "seek-request-country": "SG",
     "x-seek-site": "chalice",
@@ -518,7 +377,7 @@ function buildHeaders(sessionId: string): Record<string, string> {
     // validate against. Without it the request hits the strict default
     // and gets rejected with UNSTABLE_QUERY_ERROR.
     "x-custom-features": "application/features.seek.all+json",
-    cookie: fullCookies,
+    cookie: cookies,
     "user-agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
   };
@@ -1050,19 +909,12 @@ export async function seekGetJob(jobId: string): Promise<Job | null> {
     query: JOB_DETAIL_QUERY,
   };
 
-  await cfSession.ensureWarm();
   const res = await fetch(SEEK_GRAPHQL, {
     method: "POST",
     headers: buildHeaders(sessionId),
     body: JSON.stringify(body),
   });
-  cfSession.ingest(res);
 
-  if (res.status === 403) {
-    cfSession.invalidate();
-    const text = await res.text().catch(() => "");
-    throw new Error(`SEEK detail 403: ${text.slice(0, 200)}`);
-  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`SEEK detail ${res.status}: ${text.slice(0, 200)}`);
@@ -1136,250 +988,6 @@ export async function seekGetJob(jobId: string): Promise<Job | null> {
  *  we don't share the helper across files to keep the adapters independent.
  *  When we add `scraper/src/normalize.ts` for the dedup pass, both adapters
  *  will lift their copies up to that shared module. */
-/** Detail fetch via the SEO HTML page. Vastly more reliable than the GraphQL
- *  detail endpoint because:
- *
- *    1. No query-allowlist gateway. The HTML route doesn't check
- *       UNSTABLE_QUERY_ERROR-style signatures — it's a public document.
- *    2. Looser Cloudflare bot management. HTML pages are hit by SEO crawlers
- *       and link-unfurl bots constantly; the threshold is far higher than
- *       what they impose on /graphql POSTs.
- *    3. No session/cookie coupling. Just a plain GET — no `solId` mirroring,
- *       no `x-seek-ec-*` headers, no `__cf_bm` cookie warmth required.
- *    4. Schema stability. SEEK can't break their /job/:id HTML without
- *       breaking SEO and social previews — these are user-facing surfaces.
- *
- *  The page embeds the same data the GraphQL detail call returns, in two
- *  forms: a schema.org `JobPosting` JSON-LD block and the full Apollo
- *  cache as `window.SEEK_REDUX_DATA = {...};`. We prefer the Redux dump
- *  because it carries salary labels, work arrangements, classifications,
- *  and company profile in one shot. JSON-LD is the fallback.
- *
- *  Use this as the primary detail path. Keep `seekGetJob` (GraphQL) as a
- *  fallback for the rare cases where the HTML page is unparseable. */
-export async function seekGetJobViaHtml(jobId: string): Promise<Job | null> {
-  // Warm the cookie jar before first use (no-op on subsequent calls). The
-  // visit harvests __cf_bm + SEEK analytics cookies which let our future
-  // requests skip Cloudflare's first-contact challenge.
-  await cfSession.ensureWarm();
-
-  const url = `${SEEK_HOST}/job/${encodeURIComponent(jobId)}?type=standard`;
-  const res = await fetch(url, {
-    headers: {
-      ...browserHeaders({ referer: `${SEEK_HOST}/jobs` }),
-      cookie: cfSession.cookieHeader(),
-    },
-  });
-  cfSession.ingest(res);
-
-  if (res.status === 404) return null;
-  if (res.status === 403) {
-    // Cookies got revoked (Cloudflare detected something). Drop the jar so
-    // the next call re-warms. The caller's retry-with-backoff will then
-    // succeed with fresh cookies.
-    cfSession.invalidate();
-    const text = await res.text().catch(() => "");
-    throw new Error(`SEEK detail-html 403: ${text.slice(0, 200)}`);
-  }
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`SEEK detail-html ${res.status}: ${text.slice(0, 200)}`);
-  }
-  const html = await res.text();
-  // Bot-managed pages sometimes return 200 with a challenge body instead of
-  // 403. Detect by content; the real page always contains SEEK_REDUX_DATA.
-  if (html.includes("Just a moment...") && !html.includes("SEEK_REDUX_DATA")) {
-    cfSession.invalidate();
-    throw new Error("SEEK detail-html 200-challenge: Cloudflare interstitial");
-  }
-
-  // Primary path: lift the Apollo state dump. The opening anchor is unique;
-  // the closing one is the start of the next assignment (SEEK_APP_CONFIG)
-  // which always follows. Lazy match handles all the interior `};` safely.
-  const reduxMatch = /window\.SEEK_REDUX_DATA\s*=\s*(\{[\s\S]+?\});\s*window\.SEEK_APP_CONFIG/.exec(
-    html,
-  );
-  if (reduxMatch?.[1]) {
-    try {
-      const data = JSON.parse(reduxMatch[1]) as ReduxDump;
-      const fromRedux = jobFromReduxDump(data, jobId);
-      if (fromRedux) return fromRedux;
-    } catch (e) {
-      console.warn(`[seek-html] redux parse failed for ${jobId}:`, e);
-    }
-  }
-
-  // Fallback: schema.org JobPosting. Always present, smaller surface area,
-  // less likely to break across SEEK template revisions.
-  const jsonLdMatch = html.match(
-    /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/g,
-  );
-  if (jsonLdMatch) {
-    for (const block of jsonLdMatch) {
-      const json = block.replace(/<script[^>]*>|<\/script>/g, "");
-      try {
-        const obj = JSON.parse(json) as JsonLd;
-        if (obj["@type"] === "JobPosting") return jobFromJsonLd(obj, jobId);
-      } catch {
-        // Try the next ld+json block; one of them is the WebSite schema.
-      }
-    }
-  }
-
-  return null;
-}
-
-/** Narrow shape of the relevant slice of `window.SEEK_REDUX_DATA`. Anything
- *  we don't read stays `unknown` to avoid claiming knowledge of unstable bits. */
-interface ReduxDump {
-  jobdetails?: {
-    result?: {
-      job?: {
-        id?: string;
-        title?: string;
-        abstract?: string;
-        content?: string;
-        content2?: string;
-        isExpired?: boolean;
-        isLinkOut?: boolean;
-        expiresAt?: { dateTimeUtc?: string };
-        listedAt?: { dateTimeUtc?: string };
-        salary?: { label?: string };
-        workTypes?: { label?: string };
-        advertiser?: { name?: string };
-        location?: { label?: string };
-        classifications?: Array<{ label?: string }>;
-        tracking?: {
-          locationInfo?: { location?: string; area?: string };
-          classificationInfo?: { classification?: string; subClassification?: string };
-        };
-      };
-      workArrangements?: {
-        arrangements?: Array<{ type?: string; label?: string }>;
-      };
-      companyProfile?: {
-        branding?: { logo?: string };
-      };
-    };
-  };
-}
-
-function jobFromReduxDump(data: ReduxDump, jobId: string): Job | null {
-  const j = data.jobdetails?.result?.job;
-  if (!j || !j.title) return null;
-
-  const descriptionHtml = j.content ?? j.content2 ?? j.abstract ?? "";
-  const descriptionText = descriptionHtml ? stripHtml(descriptionHtml) : undefined;
-
-  const cls = j.tracking?.classificationInfo;
-  const categories = [
-    cls?.classification,
-    cls?.subClassification,
-    ...(j.classifications ?? []).map((c) => c.label),
-  ].filter((x): x is string => !!x);
-
-  const arrangements = (data.jobdetails?.result?.workArrangements?.arrangements ?? [])
-    .map((a) => a.label)
-    .filter((x): x is string => !!x);
-
-  return {
-    id: `seek:${j.id ?? jobId}`,
-    source: "seek",
-    sourceId: j.id ?? jobId,
-    url: `${SEEK_HOST}/job/${j.id ?? jobId}`,
-    title: j.title,
-    company: {
-      name: j.advertiser?.name ?? "Unknown",
-      logoUrl: data.jobdetails?.result?.companyProfile?.branding?.logo,
-    },
-    description: descriptionHtml,
-    descriptionText,
-    location:
-      j.location?.label
-        ?? j.tracking?.locationInfo?.location
-        ?? j.tracking?.locationInfo?.area
-        ?? "Singapore",
-    // workTypes.label is human-readable ("Contract/Temp"); map back to our union.
-    employmentTypes: j.workTypes?.label
-      ? [j.workTypes.label]
-          .flatMap((s) => s.split("/"))
-          .map((s) => mapEmploymentType(s.trim()))
-          .filter((x): x is EmploymentType => x !== null)
-      : [],
-    seniority: [] as SeniorityLevel[],
-    categories: [...categories, ...arrangements],
-    skills: [],
-    salary: parseSalaryLabel(j.salary?.label),
-    postedDate: j.listedAt?.dateTimeUtc,
-    expiryDate: j.expiresAt?.dateTimeUtc,
-  };
-}
-
-/** Schema.org JobPosting shape — the bits we actually read. */
-interface JsonLd {
-  "@type"?: string;
-  title?: string;
-  description?: string;
-  datePosted?: string;
-  validThrough?: string;
-  employmentType?: string[];
-  hiringOrganization?: {
-    name?: string;
-    logo?: string;
-  };
-  jobLocation?: {
-    address?: { addressCountry?: string; addressRegion?: string };
-  };
-  identifier?: { value?: string };
-}
-
-function jobFromJsonLd(obj: JsonLd, jobId: string): Job | null {
-  if (!obj.title) return null;
-  const id = obj.identifier?.value ?? jobId;
-  const descriptionHtml = obj.description ?? "";
-
-  // SEEK uses ALL CAPS in JSON-LD employmentType ("CONTRACTOR", "FULL_TIME").
-  // mapEmploymentType handles common variants but not these; map manually.
-  const empMap: Record<string, EmploymentType> = {
-    FULL_TIME: "Full Time",
-    PART_TIME: "Part Time",
-    CONTRACTOR: "Contract",
-    TEMPORARY: "Temporary",
-    INTERN: "Internship",
-    PER_DIEM: "Temporary",
-  };
-  const empTypes = (obj.employmentType ?? [])
-    .map((s) => empMap[s.toUpperCase()])
-    .filter((x): x is EmploymentType => !!x);
-
-  return {
-    id: `seek:${id}`,
-    source: "seek",
-    sourceId: id,
-    url: `${SEEK_HOST}/job/${id}`,
-    title: obj.title,
-    company: {
-      name: obj.hiringOrganization?.name ?? "Unknown",
-      logoUrl: obj.hiringOrganization?.logo,
-    },
-    description: descriptionHtml,
-    descriptionText: descriptionHtml ? stripHtml(descriptionHtml) : undefined,
-    location:
-      obj.jobLocation?.address?.addressRegion
-        ?? obj.jobLocation?.address?.addressCountry
-        ?? "Singapore",
-    employmentTypes: empTypes,
-    seniority: [] as SeniorityLevel[],
-    categories: [],
-    skills: [],
-    // JSON-LD doesn't carry salary in SEEK's current emission. Skip rather
-    // than fabricate a parse target.
-    salary: undefined,
-    postedDate: obj.datePosted,
-    expiryDate: obj.validThrough,
-  };
-}
-
 function stripHtml(html: string): string {
   return html
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
@@ -1411,19 +1019,12 @@ export async function seekSearch(req: JobSearchRequest): Promise<SeekSearchResul
     query: JOB_SEARCH_QUERY,
   };
 
-  await cfSession.ensureWarm();
   const res = await fetch(SEEK_GRAPHQL, {
     method: "POST",
     headers: buildHeaders(sessionId),
     body: JSON.stringify(body),
   });
-  cfSession.ingest(res);
 
-  if (res.status === 403) {
-    cfSession.invalidate();
-    const text = await res.text().catch(() => "");
-    throw new Error(`SEEK 403: ${text.slice(0, 200)}`);
-  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`SEEK ${res.status}: ${text.slice(0, 200)}`);
