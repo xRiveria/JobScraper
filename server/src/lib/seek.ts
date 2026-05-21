@@ -344,6 +344,140 @@ const JOB_SEARCH_QUERY = `query JobSearchV6($params: JobSearchV6QueryInput!, $lo
  *  load. Must match across cookies AND params or the gateway rejects. */
 const PROCESS_SOL_ID = randomUUID();
 
+// ---------------- Cloudflare bot-management session ----------------
+//
+// Cloudflare's bot management fingerprints first-contact requests on TLS
+// handshake + header set + IP reputation. The clearance signal is the
+// `__cf_bm` cookie, set on a "verified" response. Without it every request
+// looks like first contact and gets the JS challenge (403 "Just a moment...").
+//
+// We warm a single shared session by visiting sg.jobstreet.com once at startup,
+// harvest whatever cookies Cloudflare and SEEK set, and replay them on every
+// detail/GraphQL call. `__cf_bm` lasts ~30 min; we refresh proactively after
+// COOKIE_TTL_MS, and reactively when we see a 403 with a challenge body.
+//
+// This isn't a full bypass — TLS fingerprinting can still revoke clearance —
+// but it shifts most requests from "first contact" to "returning visitor"
+// and dramatically reduces challenge rate.
+
+interface CookieEntry {
+  value: string;
+  /** Epoch ms when the cookie should be considered expired. */
+  expiresAt: number;
+}
+
+const COOKIE_TTL_MS = 25 * 60 * 1000; // 25 min — refresh before __cf_bm's 30 min
+
+class CloudflareSession {
+  private jar = new Map<string, CookieEntry>();
+  private warmingPromise: Promise<void> | null = null;
+  private lastWarmAt = 0;
+
+  /** Make sure we have a fresh cookie jar before the caller fires a request.
+   *  Concurrent callers share one in-flight warmup so we don't stampede. */
+  async ensureWarm(): Promise<void> {
+    const stale = Date.now() - this.lastWarmAt > COOKIE_TTL_MS;
+    if (!stale && this.jar.size > 0) return;
+    if (this.warmingPromise) return this.warmingPromise;
+    this.warmingPromise = this.warm().finally(() => {
+      this.warmingPromise = null;
+    });
+    return this.warmingPromise;
+  }
+
+  /** Force a refresh on next call. Used when we see a 403 — the existing
+   *  cookies are no longer trusted. */
+  invalidate(): void {
+    this.jar.clear();
+    this.lastWarmAt = 0;
+  }
+
+  /** Cookie header value formatted for use in an outgoing request. */
+  cookieHeader(): string {
+    const parts: string[] = [];
+    for (const [name, entry] of this.jar) {
+      parts.push(`${name}=${entry.value}`);
+    }
+    // Inject our own process-stable identifiers alongside Cloudflare's.
+    // SEEK's GraphQL gateway cross-checks solId / Jobseeker* against headers.
+    parts.push(`sol_id=${PROCESS_SOL_ID}`);
+    return parts.join("; ");
+  }
+
+  /** Merge a Set-Cookie response into the jar. */
+  ingest(response: Response): void {
+    // Node 20+ exposes getSetCookie(); older builds need raw header access.
+    // The standard headers.get("set-cookie") joins multiple cookies with a
+    // comma which corrupts expires=Date,GMT segments, so we avoid it.
+    const setCookies =
+      typeof (response.headers as { getSetCookie?: () => string[] }).getSetCookie === "function"
+        ? (response.headers as { getSetCookie: () => string[] }).getSetCookie()
+        : [];
+    for (const raw of setCookies) {
+      const eqIdx = raw.indexOf("=");
+      const semiIdx = raw.indexOf(";");
+      if (eqIdx === -1) continue;
+      const name = raw.slice(0, eqIdx).trim();
+      const value = raw.slice(eqIdx + 1, semiIdx === -1 ? undefined : semiIdx);
+      if (!name || !value) continue;
+      this.jar.set(name, {
+        value,
+        // We don't fully parse Max-Age/Expires — our own TTL is shorter than
+        // any cookie SEEK sets, so the global refresh handles staleness.
+        expiresAt: Date.now() + COOKIE_TTL_MS,
+      });
+    }
+  }
+
+  private async warm(): Promise<void> {
+    // A single SERP page-load. Cloudflare's challenge runs once and sets the
+    // `__cf_bm` clearance cookie for the rest of the visit. We don't need
+    // to actually parse anything; we just want the Set-Cookie headers.
+    try {
+      const res = await fetch(`${SEEK_HOST}/jobs`, {
+        headers: browserHeaders({ accept: "text/html" }),
+      });
+      this.ingest(res);
+      // Consume the body so the connection releases — we don't need it.
+      await res.text().catch(() => "");
+      this.lastWarmAt = Date.now();
+    } catch (e) {
+      // Don't throw — caller will hit Cloudflare directly without cookies
+      // and we'll surface the failure on the actual request instead.
+      console.warn("[seek] cookie warmup failed:", e instanceof Error ? e.message : e);
+    }
+  }
+}
+
+const cfSession = new CloudflareSession();
+
+/** Full Chrome-like header set. Cloudflare's heuristics check for the
+ *  presence and ordering of sec-ch-ua* and sec-fetch-* — a request that
+ *  looks like Node fetch (only user-agent + accept) is much more likely
+ *  to be challenged than one that mirrors a real browser navigation. */
+function browserHeaders(opts: { accept?: string; referer?: string } = {}): Record<string, string> {
+  return {
+    accept:
+      opts.accept ??
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.9",
+    "cache-control": "no-cache",
+    pragma: "no-cache",
+    priority: "u=0, i",
+    "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": opts.accept?.includes("json") ? "empty" : "document",
+    "sec-fetch-mode": opts.accept?.includes("json") ? "cors" : "navigate",
+    "sec-fetch-site": opts.referer ? "same-origin" : "none",
+    "sec-fetch-user": "?1",
+    "upgrade-insecure-requests": "1",
+    "user-agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    ...(opts.referer ? { referer: opts.referer } : {}),
+  };
+}
+
 function buildHeaders(sessionId: string): Record<string, string> {
   // SEEK's gateway hashes incoming requests against an allowlist and rejects
   // mismatches with UNSTABLE_QUERY_ERROR. From a real captured request the
@@ -357,17 +491,24 @@ function buildHeaders(sessionId: string): Record<string, string> {
   //   - param  userSessionId
   // And `solId` param must equal the `sol_id` cookie. Rotating any of these
   // independently triggers UNSTABLE_QUERY_ERROR even with a valid query.
-  const cookies = [
-    `sol_id=${PROCESS_SOL_ID}`,
-    `JobseekerSessionId=${sessionId}`,
-    `JobseekerVisitorId=${sessionId}`,
-  ].join("; ");
+  //
+  // The session-managed cookies (__cf_bm etc.) are appended via cfSession;
+  // SEEK's own Jobseeker* cookies must match the per-request session UUID
+  // so we inject them inline. sol_id is added by cfSession.cookieHeader().
+  const sessionCookies = `JobseekerSessionId=${sessionId}; JobseekerVisitorId=${sessionId}`;
+  const fullCookies = `${cfSession.cookieHeader()}; ${sessionCookies}`;
   return {
     "content-type": "application/json",
     accept: "*/*",
     "accept-language": "en-US,en;q=0.9",
     origin: SEEK_HOST,
     referer: `${SEEK_HOST}/jobs`,
+    "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
     "seek-request-brand": "jobstreet",
     "seek-request-country": "SG",
     "x-seek-site": "chalice",
@@ -377,7 +518,7 @@ function buildHeaders(sessionId: string): Record<string, string> {
     // validate against. Without it the request hits the strict default
     // and gets rejected with UNSTABLE_QUERY_ERROR.
     "x-custom-features": "application/features.seek.all+json",
-    cookie: cookies,
+    cookie: fullCookies,
     "user-agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
   };
@@ -909,12 +1050,19 @@ export async function seekGetJob(jobId: string): Promise<Job | null> {
     query: JOB_DETAIL_QUERY,
   };
 
+  await cfSession.ensureWarm();
   const res = await fetch(SEEK_GRAPHQL, {
     method: "POST",
     headers: buildHeaders(sessionId),
     body: JSON.stringify(body),
   });
+  cfSession.ingest(res);
 
+  if (res.status === 403) {
+    cfSession.invalidate();
+    const text = await res.text().catch(() => "");
+    throw new Error(`SEEK detail 403: ${text.slice(0, 200)}`);
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`SEEK detail ${res.status}: ${text.slice(0, 200)}`);
@@ -1010,21 +1158,40 @@ export async function seekGetJob(jobId: string): Promise<Job | null> {
  *  Use this as the primary detail path. Keep `seekGetJob` (GraphQL) as a
  *  fallback for the rare cases where the HTML page is unparseable. */
 export async function seekGetJobViaHtml(jobId: string): Promise<Job | null> {
+  // Warm the cookie jar before first use (no-op on subsequent calls). The
+  // visit harvests __cf_bm + SEEK analytics cookies which let our future
+  // requests skip Cloudflare's first-contact challenge.
+  await cfSession.ensureWarm();
+
   const url = `${SEEK_HOST}/job/${encodeURIComponent(jobId)}?type=standard`;
   const res = await fetch(url, {
     headers: {
-      "user-agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "accept-language": "en-US,en;q=0.9",
+      ...browserHeaders({ referer: `${SEEK_HOST}/jobs` }),
+      cookie: cfSession.cookieHeader(),
     },
   });
+  cfSession.ingest(res);
+
   if (res.status === 404) return null;
+  if (res.status === 403) {
+    // Cookies got revoked (Cloudflare detected something). Drop the jar so
+    // the next call re-warms. The caller's retry-with-backoff will then
+    // succeed with fresh cookies.
+    cfSession.invalidate();
+    const text = await res.text().catch(() => "");
+    throw new Error(`SEEK detail-html 403: ${text.slice(0, 200)}`);
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`SEEK detail-html ${res.status}: ${text.slice(0, 200)}`);
   }
   const html = await res.text();
+  // Bot-managed pages sometimes return 200 with a challenge body instead of
+  // 403. Detect by content; the real page always contains SEEK_REDUX_DATA.
+  if (html.includes("Just a moment...") && !html.includes("SEEK_REDUX_DATA")) {
+    cfSession.invalidate();
+    throw new Error("SEEK detail-html 200-challenge: Cloudflare interstitial");
+  }
 
   // Primary path: lift the Apollo state dump. The opening anchor is unique;
   // the closing one is the start of the next assignment (SEEK_APP_CONFIG)
@@ -1244,12 +1411,19 @@ export async function seekSearch(req: JobSearchRequest): Promise<SeekSearchResul
     query: JOB_SEARCH_QUERY,
   };
 
+  await cfSession.ensureWarm();
   const res = await fetch(SEEK_GRAPHQL, {
     method: "POST",
     headers: buildHeaders(sessionId),
     body: JSON.stringify(body),
   });
+  cfSession.ingest(res);
 
+  if (res.status === 403) {
+    cfSession.invalidate();
+    const text = await res.text().catch(() => "");
+    throw new Error(`SEEK 403: ${text.slice(0, 200)}`);
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`SEEK ${res.status}: ${text.slice(0, 200)}`);
