@@ -13,7 +13,7 @@
 // observed rate-limit thresholds.
 
 import type { Job } from "@aggregator/shared";
-import { seekGetJob, seekSearch } from "../../../server/src/lib/seek.js";
+import { seekGetJob, seekGetJobViaHtml, seekSearch } from "../../../server/src/lib/seek.js";
 
 const PAGE_SIZE = 32; // SEEK caps pageSize at 32 regardless of what we send
 const MAX_PAGES = 400; // 12.8k jobs ceiling
@@ -93,6 +93,17 @@ async function enrichOne(job: Job): Promise<Job> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= DETAIL_MAX_RETRIES; attempt++) {
     try {
+      // PRIMARY: the SEO HTML page. Embeds the same Apollo data the GraphQL
+      // detail call returns, but isn't behind the query-allowlist gateway
+      // and has far looser Cloudflare rate limits (SEO traffic is expected).
+      // This avoids the entire UNSTABLE_QUERY_ERROR class of failures.
+      const fromHtml = await seekGetJobViaHtml(job.sourceId);
+      if (fromHtml) return mergeListingAndDetail(job, fromHtml);
+
+      // SECONDARY: fall through to the GraphQL detail call. Used only when
+      // the HTML page returned 200 but neither SEEK_REDUX_DATA nor JSON-LD
+      // could be parsed (rare — usually means SEEK ran an A/B that swapped
+      // the SPA shell). Keeps the system resilient to template revisions.
       const detail = await seekGetJob(job.sourceId);
       if (!detail) return job;
       return mergeListingAndDetail(job, detail);

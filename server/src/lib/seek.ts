@@ -988,6 +988,231 @@ export async function seekGetJob(jobId: string): Promise<Job | null> {
  *  we don't share the helper across files to keep the adapters independent.
  *  When we add `scraper/src/normalize.ts` for the dedup pass, both adapters
  *  will lift their copies up to that shared module. */
+/** Detail fetch via the SEO HTML page. Vastly more reliable than the GraphQL
+ *  detail endpoint because:
+ *
+ *    1. No query-allowlist gateway. The HTML route doesn't check
+ *       UNSTABLE_QUERY_ERROR-style signatures — it's a public document.
+ *    2. Looser Cloudflare bot management. HTML pages are hit by SEO crawlers
+ *       and link-unfurl bots constantly; the threshold is far higher than
+ *       what they impose on /graphql POSTs.
+ *    3. No session/cookie coupling. Just a plain GET — no `solId` mirroring,
+ *       no `x-seek-ec-*` headers, no `__cf_bm` cookie warmth required.
+ *    4. Schema stability. SEEK can't break their /job/:id HTML without
+ *       breaking SEO and social previews — these are user-facing surfaces.
+ *
+ *  The page embeds the same data the GraphQL detail call returns, in two
+ *  forms: a schema.org `JobPosting` JSON-LD block and the full Apollo
+ *  cache as `window.SEEK_REDUX_DATA = {...};`. We prefer the Redux dump
+ *  because it carries salary labels, work arrangements, classifications,
+ *  and company profile in one shot. JSON-LD is the fallback.
+ *
+ *  Use this as the primary detail path. Keep `seekGetJob` (GraphQL) as a
+ *  fallback for the rare cases where the HTML page is unparseable. */
+export async function seekGetJobViaHtml(jobId: string): Promise<Job | null> {
+  const url = `${SEEK_HOST}/job/${encodeURIComponent(jobId)}?type=standard`;
+  const res = await fetch(url, {
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "accept-language": "en-US,en;q=0.9",
+    },
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`SEEK detail-html ${res.status}: ${text.slice(0, 200)}`);
+  }
+  const html = await res.text();
+
+  // Primary path: lift the Apollo state dump. The opening anchor is unique;
+  // the closing one is the start of the next assignment (SEEK_APP_CONFIG)
+  // which always follows. Lazy match handles all the interior `};` safely.
+  const reduxMatch = /window\.SEEK_REDUX_DATA\s*=\s*(\{[\s\S]+?\});\s*window\.SEEK_APP_CONFIG/.exec(
+    html,
+  );
+  if (reduxMatch?.[1]) {
+    try {
+      const data = JSON.parse(reduxMatch[1]) as ReduxDump;
+      const fromRedux = jobFromReduxDump(data, jobId);
+      if (fromRedux) return fromRedux;
+    } catch (e) {
+      console.warn(`[seek-html] redux parse failed for ${jobId}:`, e);
+    }
+  }
+
+  // Fallback: schema.org JobPosting. Always present, smaller surface area,
+  // less likely to break across SEEK template revisions.
+  const jsonLdMatch = html.match(
+    /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/g,
+  );
+  if (jsonLdMatch) {
+    for (const block of jsonLdMatch) {
+      const json = block.replace(/<script[^>]*>|<\/script>/g, "");
+      try {
+        const obj = JSON.parse(json) as JsonLd;
+        if (obj["@type"] === "JobPosting") return jobFromJsonLd(obj, jobId);
+      } catch {
+        // Try the next ld+json block; one of them is the WebSite schema.
+      }
+    }
+  }
+
+  return null;
+}
+
+/** Narrow shape of the relevant slice of `window.SEEK_REDUX_DATA`. Anything
+ *  we don't read stays `unknown` to avoid claiming knowledge of unstable bits. */
+interface ReduxDump {
+  jobdetails?: {
+    result?: {
+      job?: {
+        id?: string;
+        title?: string;
+        abstract?: string;
+        content?: string;
+        content2?: string;
+        isExpired?: boolean;
+        isLinkOut?: boolean;
+        expiresAt?: { dateTimeUtc?: string };
+        listedAt?: { dateTimeUtc?: string };
+        salary?: { label?: string };
+        workTypes?: { label?: string };
+        advertiser?: { name?: string };
+        location?: { label?: string };
+        classifications?: Array<{ label?: string }>;
+        tracking?: {
+          locationInfo?: { location?: string; area?: string };
+          classificationInfo?: { classification?: string; subClassification?: string };
+        };
+      };
+      workArrangements?: {
+        arrangements?: Array<{ type?: string; label?: string }>;
+      };
+      companyProfile?: {
+        branding?: { logo?: string };
+      };
+    };
+  };
+}
+
+function jobFromReduxDump(data: ReduxDump, jobId: string): Job | null {
+  const j = data.jobdetails?.result?.job;
+  if (!j || !j.title) return null;
+
+  const descriptionHtml = j.content ?? j.content2 ?? j.abstract ?? "";
+  const descriptionText = descriptionHtml ? stripHtml(descriptionHtml) : undefined;
+
+  const cls = j.tracking?.classificationInfo;
+  const categories = [
+    cls?.classification,
+    cls?.subClassification,
+    ...(j.classifications ?? []).map((c) => c.label),
+  ].filter((x): x is string => !!x);
+
+  const arrangements = (data.jobdetails?.result?.workArrangements?.arrangements ?? [])
+    .map((a) => a.label)
+    .filter((x): x is string => !!x);
+
+  return {
+    id: `seek:${j.id ?? jobId}`,
+    source: "seek",
+    sourceId: j.id ?? jobId,
+    url: `${SEEK_HOST}/job/${j.id ?? jobId}`,
+    title: j.title,
+    company: {
+      name: j.advertiser?.name ?? "Unknown",
+      logoUrl: data.jobdetails?.result?.companyProfile?.branding?.logo,
+    },
+    description: descriptionHtml,
+    descriptionText,
+    location:
+      j.location?.label
+        ?? j.tracking?.locationInfo?.location
+        ?? j.tracking?.locationInfo?.area
+        ?? "Singapore",
+    // workTypes.label is human-readable ("Contract/Temp"); map back to our union.
+    employmentTypes: j.workTypes?.label
+      ? [j.workTypes.label]
+          .flatMap((s) => s.split("/"))
+          .map((s) => mapEmploymentType(s.trim()))
+          .filter((x): x is EmploymentType => x !== null)
+      : [],
+    seniority: [] as SeniorityLevel[],
+    categories: [...categories, ...arrangements],
+    skills: [],
+    salary: parseSalaryLabel(j.salary?.label),
+    postedDate: j.listedAt?.dateTimeUtc,
+    expiryDate: j.expiresAt?.dateTimeUtc,
+  };
+}
+
+/** Schema.org JobPosting shape — the bits we actually read. */
+interface JsonLd {
+  "@type"?: string;
+  title?: string;
+  description?: string;
+  datePosted?: string;
+  validThrough?: string;
+  employmentType?: string[];
+  hiringOrganization?: {
+    name?: string;
+    logo?: string;
+  };
+  jobLocation?: {
+    address?: { addressCountry?: string; addressRegion?: string };
+  };
+  identifier?: { value?: string };
+}
+
+function jobFromJsonLd(obj: JsonLd, jobId: string): Job | null {
+  if (!obj.title) return null;
+  const id = obj.identifier?.value ?? jobId;
+  const descriptionHtml = obj.description ?? "";
+
+  // SEEK uses ALL CAPS in JSON-LD employmentType ("CONTRACTOR", "FULL_TIME").
+  // mapEmploymentType handles common variants but not these; map manually.
+  const empMap: Record<string, EmploymentType> = {
+    FULL_TIME: "Full Time",
+    PART_TIME: "Part Time",
+    CONTRACTOR: "Contract",
+    TEMPORARY: "Temporary",
+    INTERN: "Internship",
+    PER_DIEM: "Temporary",
+  };
+  const empTypes = (obj.employmentType ?? [])
+    .map((s) => empMap[s.toUpperCase()])
+    .filter((x): x is EmploymentType => !!x);
+
+  return {
+    id: `seek:${id}`,
+    source: "seek",
+    sourceId: id,
+    url: `${SEEK_HOST}/job/${id}`,
+    title: obj.title,
+    company: {
+      name: obj.hiringOrganization?.name ?? "Unknown",
+      logoUrl: obj.hiringOrganization?.logo,
+    },
+    description: descriptionHtml,
+    descriptionText: descriptionHtml ? stripHtml(descriptionHtml) : undefined,
+    location:
+      obj.jobLocation?.address?.addressRegion
+        ?? obj.jobLocation?.address?.addressCountry
+        ?? "Singapore",
+    employmentTypes: empTypes,
+    seniority: [] as SeniorityLevel[],
+    categories: [],
+    skills: [],
+    // JSON-LD doesn't carry salary in SEEK's current emission. Skip rather
+    // than fabricate a parse target.
+    salary: undefined,
+    postedDate: obj.datePosted,
+    expiryDate: obj.validThrough,
+  };
+}
+
 function stripHtml(html: string): string {
   return html
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
