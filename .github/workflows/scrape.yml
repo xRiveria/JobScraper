@@ -1,11 +1,15 @@
 name: Scrape jobs
 
-# Runs daily at 6am SGT and publishes a fresh data/jobs.json to the orphan
+# Runs daily at 6am SGT and publishes a fresh data/jobs.json.gz to the orphan
 # `data` branch. The `data` branch is recreated from scratch each run so its
 # git history stays exactly one commit deep — no repo bloat from 20MB daily diffs.
 #
+# Why gzipped: the raw snapshot is >100MB (currently ~104MB) which exceeds
+# GitHub's hard file-size limit. gzip -9 brings it to ~12-18MB and the client
+# decompresses on the fly via the browser's built-in DecompressionStream API.
+#
 # Client consumes the published file at:
-#   https://raw.githubusercontent.com/${{ github.repository }}/data/jobs.json
+#   https://raw.githubusercontent.com/${{ github.repository }}/data/jobs.json.gz
 #
 # Manual triggers (workflow_dispatch) are enabled so you can force a refresh
 # without waiting for the schedule.
@@ -47,17 +51,45 @@ jobs:
           GIT_COMMITTER_NAME: github-actions[bot]
           GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
         run: |
-          # Move the generated files out of the working tree so we can create
-          # a clean orphan branch containing only the artifacts.
-          cp data/jobs.json /tmp/jobs.json
+          # Compress the snapshot before publishing. Raw jobs.json is >100MB
+          # which trips GitHub's hard file-size limit; gzip -9 brings it to
+          # ~12-18MB and the client decompresses via DecompressionStream.
+          RAW_BYTES=$(stat -c %s data/jobs.json)
+          gzip -9 -c data/jobs.json > /tmp/jobs.json.gz
+          GZ_BYTES=$(stat -c %s /tmp/jobs.json.gz)
+          echo "Snapshot: ${RAW_BYTES} bytes raw → ${GZ_BYTES} bytes gzipped"
+
+          # Hard-fail if even the gzip exceeds GitHub's 100MB ceiling. At that
+          # point we'd need to split into chunks or move off-GitHub entirely.
+          if [ "$GZ_BYTES" -gt 104857600 ]; then
+            echo "::error::Compressed snapshot exceeds 100MB — need to split or trim fields"
+            exit 1
+          fi
+
+          # Move artifacts out of the working tree so we can create a clean
+          # orphan branch containing only the published files.
+          cp /tmp/jobs.json.gz /tmp/jobs.json.gz.kept
           cp data/merges.md /tmp/merges.md
+
+          # Tiny meta companion so clients can render freshness/size badges
+          # without downloading the full snapshot first.
+          cat > /tmp/meta.json <<META
+          {
+            "generatedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "rawBytes": ${RAW_BYTES},
+            "compressedBytes": ${GZ_BYTES},
+            "encoding": "gzip",
+            "schemaVersion": 1
+          }
+          META
 
           # Orphan branch = no parent commit = history stays 1 deep on force-push.
           git checkout --orphan data
           git rm -rf . > /dev/null
           mkdir -p data
-          mv /tmp/jobs.json data/jobs.json
+          mv /tmp/jobs.json.gz.kept data/jobs.json.gz
           mv /tmp/merges.md data/merges.md
+          mv /tmp/meta.json data/meta.json
 
           # A tiny README so visitors to the branch understand what they're looking at.
           cat > README.md <<'EOF'
@@ -66,9 +98,11 @@ jobs:
           This is an orphan branch auto-rebuilt by `.github/workflows/scrape.yml`.
           Contents:
 
-          - `data/jobs.json` — snapshot of Singapore job listings (last 30 days)
+          - `data/jobs.json.gz` — gzipped snapshot of Singapore job listings
             from MyCareersFuture, JobStreet, and careers.gov.sg, deduped and
-            normalized.
+            normalized. Client decompresses on the fly via DecompressionStream.
+          - `data/meta.json` — small companion file with generation timestamp
+            and size metadata. Cheap to fetch for freshness badges.
           - `data/merges.md` — human-readable audit log of every merge the
             dedupe pass performed during this run.
 
@@ -76,6 +110,6 @@ jobs:
           always exactly one commit deep.
           EOF
 
-          git add data/jobs.json data/merges.md README.md
+          git add data/jobs.json.gz data/merges.md data/meta.json README.md
           git commit -m "Scrape $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           git push --force origin data
